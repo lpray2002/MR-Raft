@@ -1,0 +1,48 @@
+# Multi-stage build for Priority-Election Server (performance-aware election)
+FROM golang:1.23-alpine AS builder
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的构建工具
+RUN apk add git make gcc musl-dev
+
+# 配置Go模块代理（使用goproxy.cn）
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.org
+ENV GO111MODULE=on
+
+WORKDIR /build
+
+# go.mod 含本地 replace（含改过的 dragonboat-3.3.8），需复制全部源码
+COPY . .
+
+RUN go mod tidy && go mod download
+
+# 构建性能感知选举服务端
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o priority-election-server ./cmd/priority-election-server
+
+# 运行时镜像
+FROM alpine:latest
+
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+RUN apk add ca-certificates libc6-compat
+
+# 创建非root用户
+RUN addgroup -g 1000 mec && \
+    adduser -D -u 1000 -G mec mec
+
+RUN mkdir -p /data && \
+    chown -R mec:mec /data && \
+    chmod -R 755 /data
+
+COPY --from=builder /build/priority-election-server /usr/local/bin/priority-election-server
+RUN chmod +x /usr/local/bin/priority-election-server
+
+WORKDIR /data
+
+EXPOSE 30000-30100 50051
+
+USER mec
+
+CMD ["/usr/local/bin/priority-election-server"]

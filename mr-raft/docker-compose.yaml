@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  # MEC节点1
+  mec-node-1:
+    image: multi-region-raft/mec-grpc-full:latest
+    container_name: mec-node-1
+    hostname: mec-node-1
+    network_mode: host
+    environment:
+      - MEC_NODE_ID=1
+      - MEC_NODE_NAME=mec-node-1
+      - MEC_NODE_ADDRESS=127.0.0.1:30001
+      - MEC_NODE_DATA_DIR=/data
+      - MEC_NODE_REGIONS=1,2
+      - USE_MEMORY_SM=false
+      - GRPC_PORT=50051
+      - GOMAXPROCS=2
+      # Region成员配置: RaftNodeID = RegionID*100 + NodeID
+      - CLUSTER_MEMBERS_1=101:127.0.0.1:30001,102:127.0.0.1:30002,103:127.0.0.1:30003
+      - CLUSTER_MEMBERS_2=201:127.0.0.1:30001,202:127.0.0.1:30002,203:127.0.0.1:30003
+    volumes:
+      - ./docker-data/mec-node-1:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # MEC节点2
+  mec-node-2:
+    image: multi-region-raft/mec-grpc-full:latest
+    container_name: mec-node-2
+    hostname: mec-node-2
+    network_mode: host
+    environment:
+      - MEC_NODE_ID=2
+      - MEC_NODE_NAME=mec-node-2
+      - MEC_NODE_ADDRESS=127.0.0.1:30002
+      - MEC_NODE_DATA_DIR=/data
+      - MEC_NODE_REGIONS=1,2
+      - USE_MEMORY_SM=false
+      - GRPC_PORT=50052
+      - GOMAXPROCS=2
+      # Region成员配置: RaftNodeID = RegionID*100 + NodeID
+      - CLUSTER_MEMBERS_1=101:127.0.0.1:30001,102:127.0.0.1:30002,103:127.0.0.1:30003
+      - CLUSTER_MEMBERS_2=201:127.0.0.1:30001,202:127.0.0.1:30002,203:127.0.0.1:30003
+    volumes:
+      - ./docker-data/mec-node-2:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # MEC节点3
+  mec-node-3:
+    image: multi-region-raft/mec-grpc-full:latest
+    container_name: mec-node-3
+    hostname: mec-node-3
+    network_mode: host
+    environment:
+      - MEC_NODE_ID=3
+      - MEC_NODE_NAME=mec-node-3
+      - MEC_NODE_ADDRESS=127.0.0.1:30003
+      - MEC_NODE_DATA_DIR=/data
+      - MEC_NODE_REGIONS=1,2
+      - USE_MEMORY_SM=false
+      - GRPC_PORT=50053
+      - GOMAXPROCS=2
+      # Region成员配置: RaftNodeID = RegionID*100 + NodeID
+      - CLUSTER_MEMBERS_1=101:127.0.0.1:30001,102:127.0.0.1:30002,103:127.0.0.1:30003
+      - CLUSTER_MEMBERS_2=201:127.0.0.1:30001,202:127.0.0.1:30002,203:127.0.0.1:30003
+    volumes:
+      - ./docker-data/mec-node-3:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  mec-node-1-data:
+  mec-node-2-data:
+  mec-node-3-data:

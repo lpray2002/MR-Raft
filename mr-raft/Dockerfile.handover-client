@@ -1,0 +1,37 @@
+# Multi-stage build for Handover Client
+FROM golang:1.23-alpine AS builder
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的构建工具
+RUN apk add --no-cache git make gcc musl-dev
+
+# 配置Go模块代理（使用goproxy.cn）
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.org
+ENV GO111MODULE=on
+
+# 设置工作目录
+WORKDIR /build
+
+COPY . .
+
+RUN go mod tidy && go mod download
+
+# 构建 handover-client（纯静态编译）
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o handover-client ./cmd/handover-client
+
+# 运行时镜像
+FROM alpine:latest
+
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /build/handover-client /usr/local/bin/handover-client
+RUN chmod +x /usr/local/bin/handover-client
+
+ENTRYPOINT ["/usr/local/bin/handover-client"]

@@ -1,0 +1,123 @@
+# Global方法配置
+# 特点: 所有节点在同一个大分区，适合全局一致性
+# 15个MEC节点，1个Region
+
+mec_nodes:
+  - name: mec-node-0
+    id: 0
+    address: "127.0.0.1:30000"
+    api_port: 40000
+    regions: [1]
+
+  - name: mec-node-1
+    id: 1
+    address: "127.0.0.1:30001"
+    api_port: 40001
+    regions: [1]
+
+  - name: mec-node-2
+    id: 2
+    address: "127.0.0.1:30002"
+    api_port: 40002
+    regions: [1]
+
+  - name: mec-node-3
+    id: 3
+    address: "127.0.0.1:30003"
+    api_port: 40003
+    regions: [1]
+
+  - name: mec-node-4
+    id: 4
+    address: "127.0.0.1:30004"
+    api_port: 40004
+    regions: [1]
+
+  - name: mec-node-5
+    id: 5
+    address: "127.0.0.1:30005"
+    api_port: 40005
+    regions: [1]
+
+  - name: mec-node-6
+    id: 6
+    address: "127.0.0.1:30006"
+    api_port: 40006
+    regions: [1]
+
+  - name: mec-node-7
+    id: 7
+    address: "127.0.0.1:30007"
+    api_port: 40007
+    regions: [1]
+
+  - name: mec-node-8
+    id: 8
+    address: "127.0.0.1:30008"
+    api_port: 40008
+    regions: [1]
+
+  - name: mec-node-9
+    id: 9
+    address: "127.0.0.1:30009"
+    api_port: 40009
+    regions: [1]
+
+  - name: mec-node-10
+    id: 10
+    address: "127.0.0.1:30010"
+    api_port: 40010
+    regions: [1]
+
+  - name: mec-node-11
+    id: 11
+    address: "127.0.0.1:30011"
+    api_port: 40011
+    regions: [1]
+
+  - name: mec-node-12
+    id: 12
+    address: "127.0.0.1:30012"
+    api_port: 40012
+    regions: [1]
+
+  - name: mec-node-13
+    id: 13
+    address: "127.0.0.1:30013"
+    api_port: 40013
+    regions: [1]
+
+  - name: mec-node-14
+    id: 14
+    address: "127.0.0.1:30014"
+    api_port: 40014
+    regions: [1]
+
+
+regions:
+  - id: 1
+    name: "Global-Region"
+
+
+benchmark:
+  duration: 60s
+  # 1个region，每个region 10 clients = 10 total clients（最低负载）
+  clients_per_region: [10, 20, 30, 40]  # 多个客户端数量，依次测试
+  base_port: 30000
+  # optimization_level: Default
+  data_dir: /data
+  proposal_size: 128
+  method_name: "global"  # 方法名称，用于容器命名
+
+resources:
+  # Leader节点资源配置（第一个节点）
+  leader_cpu_limit: "4.0"            # CPU限制：4个核心
+  leader_memory_limit: "2G"          # 内存限制：2GB
+  leader_cpu_reservation: "2.0"      # CPU预留：2个核心
+  leader_memory_reservation: "1G"    # 内存预留：1GB
+  # Follower节点资源配置（其他节点）
+  follower_cpu_limit: "4.0"          # CPU限制：2个核心
+  follower_memory_limit: "2G"        # 内存限制：2GB
+  follower_cpu_reservation: "2.0"    # CPU预留：1个核心
+  follower_memory_reservation: "1G" # 内存预留：512MB
+

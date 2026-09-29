@@ -1,0 +1,115 @@
+# Threshold-based方法配置
+# 特点: 基于阈值的智能划分，权衡分区大小和实例数量
+# 15个MEC节点，每个节点参与不同数量的Region
+# 节点分区: 0:[1] 1:[2,3] 2:[1,4] 3:[2] 4:[5] 5:[3] 6:[1] 7:[1,4] 8:[3] 9:[2,4] 10:[5] 11:[1,5] 12:[2,4] 13:[2] 14:[4]
+
+mec_nodes:
+  - name: mec-node-0
+    id: 0
+    address: "127.0.0.1:33000"
+    api_port: 43000
+    regions: [1]
+    
+  - name: mec-node-1
+    id: 1
+    address: "127.0.0.1:33001"
+    api_port: 43001
+    regions: [2, 3]
+    
+  - name: mec-node-2
+    id: 2
+    address: "127.0.0.1:33002"
+    api_port: 43002
+    regions: [1, 4]
+    
+  - name: mec-node-3
+    id: 3
+    address: "127.0.0.1:33003"
+    api_port: 43003
+    regions: [2]
+    
+  - name: mec-node-4
+    id: 4
+    address: "127.0.0.1:33004"
+    api_port: 43004
+    regions: [5]
+    
+  - name: mec-node-5
+    id: 5
+    address: "127.0.0.1:33005"
+    api_port: 43005
+    regions: [3]
+    
+  - name: mec-node-6
+    id: 6
+    address: "127.0.0.1:33006"
+    api_port: 43006
+    regions: [1]
+    
+  - name: mec-node-7
+    id: 7
+    address: "127.0.0.1:33007"
+    api_port: 43007
+    regions: [1, 4]
+    
+  - name: mec-node-8
+    id: 8
+    address: "127.0.0.1:33008"
+    api_port: 43008
+    regions: [3]
+    
+  - name: mec-node-9
+    id: 9
+    address: "127.0.0.1:33009"
+    api_port: 43009
+    regions: [2, 4]
+    
+  - name: mec-node-10
+    id: 10
+    address: "127.0.0.1:33010"
+    api_port: 43010
+    regions: [5]
+    
+  - name: mec-node-11
+    id: 11
+    address: "127.0.0.1:33011"
+    api_port: 43011
+    regions: [1, 5]
+    
+  - name: mec-node-12
+    id: 12
+    address: "127.0.0.1:33012"
+    api_port: 43012
+    regions: [2, 4]
+    
+  - name: mec-node-13
+    id: 13
+    address: "127.0.0.1:33013"
+    api_port: 43013
+    regions: [2]
+    
+  - name: mec-node-14
+    id: 14
+    address: "127.0.0.1:33014"
+    api_port: 43014
+    regions: [4]
+
+regions:
+  - id: 1
+    name: "Threshold-Region-1"
+  - id: 2
+    name: "Threshold-Region-2"
+  - id: 3
+    name: "Threshold-Region-3"
+  - id: 4
+    name: "Threshold-Region-4"
+  - id: 5
+    name: "Threshold-Region-5"
+
+benchmark:
+  duration: 60s
+  base_port: 30000
+  data_dir: /data
+  proposal_size: 128
+  method_name: "threshold"  # 方法名称，用于容器命名
+

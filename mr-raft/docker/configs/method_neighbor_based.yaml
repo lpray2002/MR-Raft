@@ -1,0 +1,122 @@
+# Neighbor-based方法配置
+# 特点: 基于邻居关系划分，每个节点管理多个邻近区域
+# 15个MEC节点，每个节点参与不同数量的Region
+# 节点分区: 0:[1,2,3] 1:[4,5,6,7] 2:[1,2,4,6] 3:[5,6] 4:[8,9] 5:[5,7] 6:[2,3,9] 7:[1,2,4] 8:[7] 9:[1,4,5,6] 10:[8] 11:[3,8,9] 12:[1,4,5,6] 13:[4,5,6] 14:[1,4]
+
+mec_nodes:
+  - name: mec-node-0
+    id: 0
+    address: "127.0.0.1:31000"
+    api_port: 41000
+    regions: [1, 2, 3]
+    
+  - name: mec-node-1
+    id: 1
+    address: "127.0.0.1:31001"
+    api_port: 41001
+    regions: [4, 5, 6, 7]
+    
+  - name: mec-node-2
+    id: 2
+    address: "127.0.0.1:31002"
+    api_port: 41002
+    regions: [1, 2, 4, 6]
+    
+  - name: mec-node-3
+    id: 3
+    address: "127.0.0.1:31003"
+    api_port: 41003
+    regions: [5, 6]
+    
+  - name: mec-node-4
+    id: 4
+    address: "127.0.0.1:31004"
+    api_port: 41004
+    regions: [8, 9]
+    
+  - name: mec-node-5
+    id: 5
+    address: "127.0.0.1:31005"
+    api_port: 41005
+    regions: [5, 7]
+    
+  - name: mec-node-6
+    id: 6
+    address: "127.0.0.1:31006"
+    api_port: 41006
+    regions: [2, 3, 9]
+    
+  - name: mec-node-7
+    id: 7
+    address: "127.0.0.1:31007"
+    api_port: 41007
+    regions: [1, 2, 4]
+    
+  - name: mec-node-8
+    id: 8
+    address: "127.0.0.1:31008"
+    api_port: 41008
+    regions: [7]
+    
+  - name: mec-node-9
+    id: 9
+    address: "127.0.0.1:31009"
+    api_port: 41009
+    regions: [1, 4, 5, 6]
+    
+  - name: mec-node-10
+    id: 10
+    address: "127.0.0.1:31010"
+    api_port: 41010
+    regions: [8]
+    
+  - name: mec-node-11
+    id: 11
+    address: "127.0.0.1:31011"
+    api_port: 41011
+    regions: [3, 8, 9]
+    
+  - name: mec-node-12
+    id: 12
+    address: "127.0.0.1:31012"
+    api_port: 41012
+    regions: [1, 4, 5, 6]
+    
+  - name: mec-node-13
+    id: 13
+    address: "127.0.0.1:31013"
+    api_port: 41013
+    regions: [4, 5, 6]
+    
+  - name: mec-node-14
+    id: 14
+    address: "127.0.0.1:31014"
+    api_port: 41014
+    regions: [1, 4]
+
+regions:
+  - id: 1
+    name: "Neighbor-Region-1"
+  - id: 2
+    name: "Neighbor-Region-2"
+  - id: 3
+    name: "Neighbor-Region-3"
+  - id: 4
+    name: "Neighbor-Region-4"
+  - id: 5
+    name: "Neighbor-Region-5"
+  - id: 6
+    name: "Neighbor-Region-6"
+  - id: 7
+    name: "Neighbor-Region-7"
+  - id: 8
+    name: "Neighbor-Region-8"
+  - id: 9
+    name: "Neighbor-Region-9"
+
+benchmark:
+  duration: 60s
+  base_port: 30000
+  data_dir: /data
+  proposal_size: 128
+  method_name: "neighbor"  # 方法名称，用于容器命名

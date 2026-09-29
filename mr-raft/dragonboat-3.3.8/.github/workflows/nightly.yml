@@ -1,0 +1,27 @@
+on:
+  schedule:
+  - cron: '30 19 * * *'
+name: Nightly
+jobs:
+  monkey-test:
+    runs-on: ubuntu-18.04
+    strategy:
+      matrix:
+        target: [race-monkey-test, race-ondisk-monkey-test, memfs-monkey-test, memfs-ondisk-monkey-test]
+    steps:
+    - name: Install Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.15.x
+    - name: Test
+      env:
+        DRUMMER_NIGHTLY_PASSWORD: ${{ secrets.DRUMMER_NIGHTLY_PASSWORD }}
+        TARGET: ${{ matrix.target }}
+      run: |
+        echo -e "machine github.com\n  login drummernightly\n password $DRUMMER_NIGHTLY_PASSWORD" > ~/.netrc
+        git config --global credential.helper "netrc -d -v"
+        git clone https://github.com/lni/drummer2 drummer
+        cd drummer
+        go get github.com/lni/dragonboat/v3@master
+        make test
+        make $TARGET

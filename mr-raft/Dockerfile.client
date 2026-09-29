@@ -1,0 +1,48 @@
+# Multi-stage build for gRPC Client (Full Topology Mode)
+FROM golang:1.23-alpine AS builder
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的构建工具
+RUN apk add --no-cache git make gcc musl-dev
+
+# 配置Go模块代理（使用goproxy.cn）
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.org
+ENV GO111MODULE=on
+
+# 设置工作目录
+WORKDIR /build
+
+# 由于go.mod中有本地replace指令，需要先复制所有源代码
+# 注意：gRPC代码（proto/raftservice/）需要提前生成
+COPY . .
+
+# 更新依赖并下载
+RUN go mod tidy && go mod download
+
+# 构建gRPC客户端程序（全拓扑版本）（纯静态编译，不需要CGO）
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o grpc-client-full ./cmd/grpc-client-full-topology
+
+# 运行时镜像
+FROM alpine:latest
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的运行时库
+RUN apk add --no-cache ca-certificates
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制编译好的二进制文件
+COPY --from=builder /build/grpc-client-full /usr/local/bin/grpc-client-full
+RUN chmod +x /usr/local/bin/grpc-client-full
+
+# 复制 proto 文件（ghz 需要）
+COPY --from=builder /build/proto /app/proto
+
+# 启动命令
+ENTRYPOINT ["/usr/local/bin/grpc-client-full"]

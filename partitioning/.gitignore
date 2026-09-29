@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Output
+*.png
+*.pdf
+!data/**/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/temp/
+data/cache/
+
+
+# CM e2e raw artefacts (large): Raft data dirs, raw JSONL logs, per-seed sweep runs
+output/cm_e2e/**/data/
+output/cm_e2e/**/*.jsonl
+output/cm_e2e/**/sweep_runs/
+output/cm_e2e/*.log
+
+# superseded pre-fix baselines: keep summaries only
+output/cm_e2e/*_v1/animation.gif

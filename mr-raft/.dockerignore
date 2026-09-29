@@ -1,0 +1,76 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker (排除所有Docker相关数据和配置)
+docker-data/
+docker-data-*/
+docker-compose*.yaml
+docker-compose*.yml
+Dockerfile*
+!Dockerfile.server
+!Dockerfile.mec-internal
+.dockerignore
+
+# Benchmark results (排除所有测试结果目录)
+benchmark-results/
+results/
+output/
+logs/
+
+# Test data (排除所有测试数据)
+testdata/
+testdata-*/
+test/testdata-*/
+test/configs/
+*.log
+*.out
+
+# Build artifacts
+bin/
+build/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Documentation (构建时不需要文档)
+*.md
+!README.md
+docs/
+
+# Scripts (构建时不需要脚本)
+scripts/
+!scripts/dragonboat-soft-settings.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.cache
+
+# Go build cache and test files
+*.sum
+vendor/
+
+# Test 目录（构建时不需要）
+test/
+
+# Docker configs (构建时不需要)
+docker/configs/
+docker/*.md
+docker/.env
+

@@ -1,0 +1,67 @@
+# Multi-stage build for MEC Node (Full Topology gRPC Mode)
+FROM golang:1.23-alpine AS builder
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的构建工具
+RUN apk add git make gcc musl-dev
+
+# 配置Go模块代理（使用goproxy.cn）
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.org
+ENV GO111MODULE=on
+
+# 设置工作目录
+WORKDIR /build
+
+# 由于go.mod中有本地replace指令，需要先复制所有源代码
+# 注意：gRPC代码（proto/raftservice/）需要提前生成
+COPY . .
+
+# 更新依赖并下载
+RUN go mod tidy && go mod download
+
+# 构建MEC节点（全拓扑版本）gRPC服务程序
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o mec-node-grpc-full ./cmd/mec-node-grpc-full-topology
+
+# 运行时镜像
+FROM alpine:latest
+
+# 配置Alpine镜像源（使用阿里云镜像）
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 安装必要的运行时库
+RUN apk add ca-certificates libc6-compat
+
+# 创建非root用户
+RUN addgroup -g 1000 mec && \
+    adduser -D -u 1000 -G mec mec
+
+# 创建数据目录并设置权限（在切换用户前）
+RUN mkdir -p /data && \
+    chown -R mec:mec /data && \
+    chmod -R 755 /data
+
+# 安装su-exec用于降权
+RUN apk add --no-cache su-exec
+
+# 复制编译好的二进制文件
+COPY --from=builder /build/mec-node-grpc-full /usr/local/bin/mec-node-grpc-full
+RUN chmod +x /usr/local/bin/mec-node-grpc-full
+
+# 🔥 复制 Dragonboat 性能优化配置（直接从主机复制，因为 scripts/ 在 .dockerignore 中）
+COPY scripts/dragonboat-soft-settings.json /data/dragonboat-soft-settings.json
+RUN chown mec:mec /data/dragonboat-soft-settings.json
+
+# 设置工作目录
+WORKDIR /data
+
+# 暴露端口（Raft通信端口和gRPC端口）
+EXPOSE 30000-30100 50051
+
+# gRPC模式需要以mec用户运行（与internal模式的root不同）
+USER mec
+
+# 启动命令
+CMD ["/usr/local/bin/mec-node-grpc-full"]

@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package raftservice;
+
+option go_package = "gitcode.com/lpray/multi-region-raft/proto/raftservice";
+
+// Raft服务定义
+service RaftService {
+  // 发送Proposal请求
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+  
+  // 获取节点状态
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  
+  // 批量发送Proposal请求（流式）
+  rpc ProposeBatch(stream ProposeRequest) returns (stream ProposeResponse);
+  
+  // 请求Leader转移
+  rpc RequestLeaderTransfer(LeaderTransferRequest) returns (LeaderTransferResponse);
+
+  // 一致性读取（用于 Handover 后验证数据一致性）
+  rpc SyncRead(SyncReadRequest) returns (SyncReadResponse);
+
+  // ===== Cluster Manager (CM) 控制面 =====
+  // CM 下发一批配置指令（region 创建/销毁、成员增删、状态承接）
+  rpc ApplyConfig(ApplyConfigRequest) returns (ApplyConfigResponse);
+
+  // 查询本节点各 region 的 Raft 成员视图（供 CM 校验收敛）
+  rpc GetMembership(MembershipRequest) returns (MembershipResponse);
+
+  // 导出某 region 本地状态机的全部 KV（region 合并时的状态承接）
+  rpc ScanRegion(ScanRequest) returns (ScanResponse);
+}
+
+// ===== CM 控制面消息 =====
+
+// 指令类型
+enum DirectiveOp {
+  START_REGION  = 0;  // 在本节点启动一个 Raft 实例（新建 region 或以 join 方式加入）
+  STOP_REGION   = 1;  // 停止本节点上的 Raft 实例（先 drain 再 StopCluster）
+  ADD_MEMBER    = 2;  // 通过 Raft 成员变更把 target 加入 region（在 region 现有成员上执行）
+  REMOVE_MEMBER = 3;  // 通过 Raft 成员变更把 target 移出 region（在 region 现有成员上执行）
+  MIGRATE_STATE = 4;  // 把 src_region 本地状态机中的 KV 重新提议到 region（状态承接）
+  PROMOTE_MEMBER = 5; // 把已以 observer 身份加入并追平日志的 target 提升为有投票权成员
+  FENCE_REGION   = 6; // 本节点停止向该 region 路由读写并等在飞请求结束，Raft 实例继续运行（退出前先隔离，再 REMOVE_MEMBER，最后 STOP_REGION）
+}
+
+// 单条配置指令（对应论文中 s_cfg：region ID、操作类型、配置版本、成员列表等元数据）
+message Directive {
+  DirectiveOp op = 1;
+  uint64 region_id = 2;
+  map<uint64, string> members = 3;   // START_REGION(join=false): 初始成员 raft_node_id -> raft 地址
+  uint64 self_raft_node_id = 4;      // START_REGION: 本节点在该 region 内的 raft node id
+  bool join = 5;                     // START_REGION: true 表示加入已存在的 region（members 留空）
+  uint64 target_raft_node_id = 6;    // ADD_MEMBER / REMOVE_MEMBER: 目标 raft node id
+  string target_addr = 7;            // ADD_MEMBER: 目标节点 raft 地址
+  uint64 src_region_id = 8;          // MIGRATE_STATE: 源 region（必须在本节点上）
+  bool wait_for_leader = 9;          // START_REGION: 阻塞直到该 region 产生 leader（用于测量 T_elect）
+  uint32 timeout_ms = 10;            // 单条指令超时（0 = 默认 5000ms）
+  bool as_observer = 11;             // ADD_MEMBER: 先以 observer（无投票权、不竞选）加入，避免新成员抢选举；START_REGION(join): 以 observer 身份启动（与 ADD_MEMBER 配套，之后由 PROMOTE_MEMBER 提升）
+}
+
+message ApplyConfigRequest {
+  uint64 version = 1;                // 配置版本号（单调递增，用于幂等）
+  repeated Directive directives = 2;
+}
+
+message DirectiveResult {
+  DirectiveOp op = 1;
+  uint64 region_id = 2;
+  bool success = 3;
+  string error = 4;
+  int64 elapsed_us = 5;              // 该指令在节点侧的执行耗时
+  int64 leader_wait_us = 6;          // START_REGION + wait_for_leader: 从启动到观察到 leader 的耗时
+  uint64 leader_id = 7;              // 观察到的 leader raft node id（0 = 未知）
+  uint32 migrated_keys = 8;          // MIGRATE_STATE: 迁移的键数
+}
+
+message ApplyConfigResponse {
+  uint64 version = 1;
+  repeated DirectiveResult results = 2;
+  int64 elapsed_us = 3;              // 整批指令总耗时
+  repeated uint64 active_regions = 4;// 应用后本节点的活跃 region 列表
+}
+
+message MembershipRequest {
+  uint64 region_id = 1;              // 0 = 所有 region
+}
+
+message RegionMembership {
+  uint64 region_id = 1;
+  map<uint64, string> members = 2;   // 有投票权成员 raft_node_id -> 地址
+  map<uint64, string> observers = 3; // observer 成员
+  uint64 config_change_id = 4;       // Raft 配置变更索引
+  uint64 leader_id = 5;
+  bool leader_valid = 6;
+  uint64 self_raft_node_id = 7;
+}
+
+message MembershipResponse {
+  uint64 version = 1;                // 本节点已应用的最新配置版本
+  repeated RegionMembership regions = 2;
+  int64 timestamp_ms = 3;
+}
+
+message ScanRequest {
+  uint64 region_id = 1;
+  uint32 limit = 2;                  // 0 = 不限
+}
+
+message ScanResponse {
+  bool success = 1;
+  string error = 2;
+  map<string, string> kvs = 3;
+  map<string, uint64> vers = 4;      // 每个键的版本（仅带版本写入的键）
+}
+
+// Proposal请求
+message ProposeRequest {
+  uint64 region_id = 1;    // Region ID
+  bytes data = 2;          // 数据内容
+  int64 client_id = 3;     // 客户端ID（用于追踪）
+  int64 request_id = 4;    // 请求ID（用于追踪）
+}
+
+// Proposal响应
+message ProposeResponse {
+  bool success = 1;        // 是否成功
+  string error = 2;        // 错误信息（如果有）
+  int64 latency_us = 3;    // 延迟（微秒）
+  int64 request_id = 4;    // 请求ID（对应请求）
+  uint64 result_index = 5; // Raft日志索引
+}
+
+// 状态请求
+message StatusRequest {
+  uint64 region_id = 1;    // Region ID (0表示所有)
+}
+
+// 状态响应
+message StatusResponse {
+  repeated RegionStatus regions = 1;
+  int64 timestamp = 2;
+}
+
+// Region状态
+message RegionStatus {
+  uint64 region_id = 1;
+  bool is_leader = 2;
+  uint64 leader_id = 3;
+  uint64 term = 4;
+  uint64 applied = 5;
+  uint64 committed = 6;
+}
+
+// Leader转移请求
+message LeaderTransferRequest {
+  uint64 region_id = 1;      // Region ID
+  uint64 target_node_id = 2; // 目标节点ID (0表示自动选择)
+}
+
+// Leader转移响应
+message LeaderTransferResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 region_id = 3;
+  uint64 target_node_id = 4;
+}
+
+// 一致性读取请求
+message SyncReadRequest {
+  uint64 region_id = 1;    // Region ID (0表示读所有region)
+  string key = 2;          // 要读取的key
+  bool stale = 3;          // true=StaleRead(本地读), false=SyncRead(ReadIndex线性一致读)
+}
+
+// 一致性读取响应
+message SyncReadResponse {
+  bool found = 1;          // key是否存在
+  string value = 2;        // 读取到的值
+  string error = 3;        // 错误信息
+  int64 latency_us = 4;   // 服务端处理延迟（微秒）
+  map<uint64, string> region_values = 5;  // 每个region的读取结果
+}
+

@@ -1,0 +1,49 @@
+# 二进制文件
+basic
+multi-mec
+*.exe
+*.out
+
+# 测试数据
+example-wal/
+example-data/
+wal-*/
+data-*/
+data/
+logs/
+rundata/
+runtime/
+
+# Go 相关
+*.test
+*.prof
+*.cover
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 文件
+.DS_Store
+Thumbs.db
+
+
+# Docker 运行数据
+docker-data/
+
+# 编译产物
+bin/
+fault-recovery-client
+fault-recovery-client-linux
+fault-recovery-server
+grpc-client-full-topology
+handover-client
+mec-node-grpc-full-topology
+priority-election-server
+
+# 实验输出
+
+.specstory/
