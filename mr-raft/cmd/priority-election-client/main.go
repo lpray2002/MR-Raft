@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,10 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "gitcode.com/lpray/multi-region-raft/proto/raftservice"
 	"github.com/bojand/ghz/runner"
+	"github.com/jhump/protoreflect/dynamic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -232,16 +233,11 @@ func runNodeBenchmark(node NodeConfig, config *BenchmarkConfig) (*runner.Report,
 		testData[i] = byte('A' + (i % 26))
 	}
 
-	dataMap := map[string]interface{}{
-		"data":       base64.StdEncoding.EncodeToString(testData),
-		"client_id":  node.NodeID,
-		"request_id": 1,
-	}
-
-	dataJSON, err := json.Marshal(dataMap)
-	if err != nil {
-		return nil, fmt.Errorf("序列化数据失败: %v", err)
-	}
+	// A repeated client/request pair is a retry of one transaction. Generate a
+	// fresh ID per RPC so this benchmark measures new commits, including when
+	// several ghz workers call the provider concurrently.
+	var requestID atomic.Int64
+	requestID.Store(time.Now().UnixNano())
 
 	connections := uint(node.Concurrency)
 	if connections < 1 {
@@ -256,7 +252,14 @@ func runNodeBenchmark(node NodeConfig, config *BenchmarkConfig) (*runner.Report,
 		runner.WithConcurrency(uint(node.Concurrency)),
 		runner.WithConnections(connections),
 		runner.WithRunDuration(config.Duration),
-		runner.WithDataFromJSON(string(dataJSON)),
+		runner.WithDataProvider(func(*runner.CallData) ([]*dynamic.Message, error) {
+			request := &pb.ProposeRequest{Data: testData, ClientId: int64(node.NodeID), RequestId: requestID.Add(1)}
+			message, err := dynamic.AsDynamicMessage(request)
+			if err != nil {
+				return nil, err
+			}
+			return []*dynamic.Message{message}, nil
+		}),
 		runner.WithTimeout(10 * time.Second),
 		runner.WithDialTimeout(10 * time.Second),
 		runner.WithKeepalive(30 * time.Second),

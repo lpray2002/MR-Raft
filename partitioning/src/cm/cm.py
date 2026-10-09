@@ -224,8 +224,10 @@ class RealExecutor:
                         if o.success:
                             break
                 outs.append(o)
-                if not o.success and d.op in (ADD_MEMBER,):
-                    break  # do not JOIN a node that was not added
+                if not o.success:
+                    # In particular, a failed FENCE must not be followed by
+                    # REMOVE/STOP of a participant with an unresolved decision.
+                    break
             return outs
         results = list(self.pool.map(run_seq, sequences))
         return [o for seq in results for o in seq]
@@ -528,6 +530,17 @@ class ClusterManager:
             phase_ms[phase] = elapsed_ms
             self._apply_outcomes(phase, outcomes, rec, t_sent, self.clock.now())
             self.snapshots.append((self.clock.now(), {c: frozenset(s) for c, s in self.serving.items()}))
+            failed = [o for o in outcomes if not o.success]
+            if failed:
+                rec.constraints_ok = False
+                rec.t_done = self.clock.now()
+                self._emit({"type": "reconfiguration_failed", "round": rec.round,
+                            "phase": phase, "errors": [o.error for o in failed]})
+                # Partial plans cannot be rolled back by changing a serving
+                # map. Stop this experiment before handoff/retirement; retain
+                # node data for decision recovery and explicit plan repair.
+                raise RuntimeError(f"CM phase {phase} failed; later phases were stopped: "
+                                   + "; ".join(o.error for o in failed))
         # retire logical ids that no longer exist
         alive = set(self.mgr.regions.keys()) if self.mgr else set()
         for rid in list(self.cluster_of):

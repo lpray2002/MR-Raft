@@ -118,7 +118,12 @@ class LocalCluster:
 
     def start(self):
         self._check_ports_free()
-        shutil.rmtree(self.data_dir, ignore_errors=True)
+        if os.path.isdir(self.data_dir) and os.listdir(self.data_dir):
+            if not getattr(self.args, "reset_data", False):
+                raise RuntimeError(f"cluster data already exists at {self.data_dir}; "
+                                   "retain it for 2PC recovery or choose a fresh output directory. "
+                                   "Use --reset-data only to discard the previous experiment.")
+            shutil.rmtree(self.data_dir)
         os.makedirs(os.path.join(self.data_dir, "logs"), exist_ok=True)
         import atexit
         atexit.register(self.stop)
@@ -135,7 +140,7 @@ class LocalCluster:
                        SNAPSHOT_ENTRIES="10000",
                        EVENT_LOG=os.path.join(self.data_dir, "logs", f"events_{mid}.jsonl"),
                        GOMAXPROCS=str(self.args.gomaxprocs),
-                       RAFT_MEMFS="false" if self.args.no_memfs else "true")
+                       RAFT_MEMFS="false")
             if self.args.delay_us > 0:
                 env["NETWORK_DELAY_US"] = str(self.args.delay_us)
             log = open(os.path.join(self.data_dir, "logs", f"node_{mid}.log"), "w")
@@ -901,7 +906,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--propose-timeout-ms", type=int, default=2000)
     p.add_argument("--delay-us", type=int, default=0)
     p.add_argument("--gomaxprocs", type=int, default=2, help="GOMAXPROCS per Go node (limits oversubscription)")
-    p.add_argument("--no-memfs", action="store_true", help="keep Raft WAL on disk (default: in-memory FS for local runs)")
+    p.add_argument("--no-memfs", action="store_true", help="compatibility flag; 2PC always keeps Raft WAL on disk")
+    p.add_argument("--reset-data", action="store_true", help="discard existing cluster data for a fresh experiment; prevents recovery of old transactions")
     # sim model (defaults = measured on the local cluster)
     p.add_argument("--model-rtt-ms", type=float, default=1.5)
     p.add_argument("--model-elect-min-ms", type=float, default=150)

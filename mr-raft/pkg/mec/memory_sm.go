@@ -20,6 +20,8 @@ type MemoryKV struct {
 	nodeID      uint64
 	data        map[string]string // 内存存储
 	vers        map[string]uint64 // 版本（仅 Ver>0 的写入）
+	txns        map[string]TxnRecord
+	locks       map[string]string // user key -> prepared transaction ID
 	mu          sync.RWMutex      // 读写锁
 	lastApplied uint64            // 最后应用的索引
 }
@@ -31,26 +33,31 @@ func NewMemoryKV(clusterID uint64, nodeID uint64) sm.IStateMachine {
 		nodeID:    nodeID,
 		data:      make(map[string]string),
 		vers:      make(map[string]uint64),
+		txns:      make(map[string]TxnRecord),
+		locks:     make(map[string]string),
 	}
 }
 
 // Update 更新状态机（纯内存操作）。
-// 当命令携带 Ver>0 时执行按版本的 last-writer-wins：旧版本的写入被忽略。
+// Legacy/migration writes with Ver>0 ignore stale copies by last-writer-wins.
+// A first 2PC PREPARE rejects stale versions instead; COMMIT applies the exact
+// immutable payload protected by that transaction's prepared key lock.
 func (m *MemoryKV) Update(data []byte) (sm.Result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var kv KVData
-	if err := json.Unmarshal(data, &kv); err != nil {
-		return sm.Result{}, err
+	txn, kv, err := decodeReplicatedCommand(data)
+	if err != nil {
+		return rejectTxn(err.Error()), nil
 	}
-	if kv.Ver > 0 {
-		if cur, ok := m.vers[kv.Key]; ok && cur >= kv.Ver {
-			return sm.Result{Value: 0}, nil // stale write ignored
-		}
-		m.vers[kv.Key] = kv.Ver
+	store := memoryParticipantStore{m}
+	if txn != nil {
+		return applyParticipantCommand(store, m.clusterID, *txn)
 	}
-	m.data[kv.Key] = kv.Val
+	applied, result, err := applyLegacyWrite(store, *kv)
+	if err != nil || !applied {
+		return result, err
+	}
 	return sm.Result{Value: uint64(len(m.data))}, nil
 }
 
@@ -59,8 +66,20 @@ func (m *MemoryKV) Lookup(query interface{}) (interface{}, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	switch q := query.(type) {
+	case *TxnQuery:
+		return m.transactionReply(q.ID), nil
+	case TxnQuery:
+		return m.transactionReply(q.ID), nil
+	case *PendingTxnQuery, PendingTxnQuery:
+		return m.pendingTransactions(), nil
+	}
+
 	// Full-state scan (used by the CM for state handoff between regions).
 	if sq, ok := query.(*ScanQuery); ok {
+		if err := pendingLockError(m.locks); err != nil {
+			return nil, err
+		}
 		out := make(map[string]string, len(m.data))
 		vers := make(map[string]uint64, len(m.vers))
 		for k, v := range m.data {
@@ -76,6 +95,12 @@ func (m *MemoryKV) Lookup(query interface{}) (interface{}, error) {
 	}
 
 	if kq, ok := query.(*KeyQuery); ok {
+		if !validUserKey(kq.Key) {
+			return nil, errors.New("invalid user key")
+		}
+		if id := m.locks[kq.Key]; id != "" {
+			return nil, &PendingTxnError{ID: id}
+		}
 		val, exists := m.data[kq.Key]
 		return &KVResult{Found: exists, Val: val, Ver: m.vers[kq.Key]}, nil
 	}
@@ -87,6 +112,12 @@ func (m *MemoryKV) Lookup(query interface{}) (interface{}, error) {
 		} else {
 			return nil, errors.New("query must be a string")
 		}
+	}
+	if !validUserKey(key) {
+		return nil, errors.New("invalid user key")
+	}
+	if id := m.locks[key]; id != "" {
+		return nil, &PendingTxnError{ID: id}
 	}
 
 	val, exists := m.data[key]
@@ -102,9 +133,10 @@ func (m *MemoryKV) SaveSnapshot(w io.Writer, fc sm.ISnapshotFileCollection, done
 	defer m.mu.RUnlock()
 
 	snapshot := &MemorySnapshot{
-		Data:        m.data,
-		Vers:        m.vers,
-		LastApplied: m.lastApplied,
+		Data:         m.data,
+		Vers:         m.vers,
+		LastApplied:  m.lastApplied,
+		Transactions: m.txns,
 	}
 	encoder := json.NewEncoder(w)
 	return encoder.Encode(snapshot)
@@ -120,13 +152,22 @@ func (m *MemoryKV) RecoverFromSnapshot(r io.Reader, files []sm.SnapshotFile, don
 	if err := decoder.Decode(&snapshot); err != nil {
 		return err
 	}
+	locks, transactions, err := restoreMemoryTransactions(snapshot.Transactions, m.clusterID)
+	if err != nil {
+		return err
+	}
 	m.data = snapshot.Data
+	if m.data == nil {
+		m.data = make(map[string]string)
+	}
 	if snapshot.Vers != nil {
 		m.vers = snapshot.Vers
 	} else {
 		m.vers = make(map[string]uint64)
 	}
 	m.lastApplied = snapshot.LastApplied
+	m.txns = transactions
+	m.locks = locks
 	return nil
 }
 
@@ -137,7 +178,8 @@ func (m *MemoryKV) Close() error {
 
 // MemorySnapshot 内存快照结构
 type MemorySnapshot struct {
-	Data        map[string]string `json:"data"`
-	Vers        map[string]uint64 `json:"vers,omitempty"`
-	LastApplied uint64            `json:"last_applied"`
+	Data         map[string]string    `json:"data"`
+	Vers         map[string]uint64    `json:"vers,omitempty"`
+	LastApplied  uint64               `json:"last_applied"`
+	Transactions map[string]TxnRecord `json:"transactions,omitempty"`
 }

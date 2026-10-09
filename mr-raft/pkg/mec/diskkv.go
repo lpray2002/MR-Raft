@@ -76,10 +76,10 @@ func syncDir(dir string) (err error) {
 }
 
 // KVData is the replicated command. Ver is an optional monotonically increasing
-// version: when Ver > 0 the state machines apply last-writer-wins by version,
-// i.e. an update carrying an older version than the stored one is ignored.
-// This makes state handoff between regions (MIGRATE_STATE, which re-proposes
-// possibly older copies) safe against overwriting fresher state.
+// version. Legacy/migration writes use last-writer-wins when Ver>0, ignoring
+// versions not newer than the stored version. A first 2PC PREPARE instead
+// rejects such versions; COMMIT applies its immutable, lock-protected payload.
+// The legacy rule keeps MIGRATE_STATE copies from overwriting fresher state.
 type KVData struct {
 	Key string
 	Val string
@@ -137,13 +137,16 @@ func (r *pebbledb) scan(limit int) (*ScanResult, error) {
 	if r.closed {
 		return nil, errors.New("db already closed")
 	}
+	if err := diskPendingLockError(r.db); err != nil {
+		return nil, err
+	}
 	iter := r.db.NewIter(r.ro)
 	defer iter.Close()
 	out := make(map[string]string)
 	vers := make(map[string]uint64)
 	for iter.First(); iter.Valid(); iter.Next() {
 		k := string(iter.Key())
-		if k == appliedIndexKey {
+		if k == appliedIndexKey || isTxnMetadata(k) {
 			continue
 		}
 		if strings.HasPrefix(k, verKeyPrefix) {
@@ -157,24 +160,16 @@ func (r *pebbledb) scan(limit int) (*ScanResult, error) {
 		}
 		out[k] = string(iter.Value())
 	}
-	return &ScanResult{KVs: out, Vers: vers}, nil
+	return &ScanResult{KVs: out, Vers: vers}, iter.Error()
 }
 
-// getVersion returns the stored version of key (0 if none). Pending writes in
-// the same batch are not visible, which is fine: one Raft entry = one key.
-func (r *pebbledb) getVersion(key string, _ *pebble.Batch) (uint64, error) {
-	val, closer, err := r.db.Get([]byte(verKeyPrefix + key))
-	if err != nil {
-		if err == pebble.ErrNotFound {
-			return 0, nil
-		}
-		return 0, err
+// An indexed batch includes preceding entries in this apply call.
+func (r *pebbledb) getVersion(key string, batch *pebble.Batch) (uint64, error) {
+	var reader pebbleGetter = r.db
+	if batch != nil {
+		reader = batch
 	}
-	defer closer.Close()
-	if len(val) != 8 {
-		return 0, nil
-	}
-	return binary.LittleEndian.Uint64(val), nil
+	return (diskParticipantStore{reader: reader}).version(key)
 }
 
 // createDB creates a PebbleDB DB in the specified directory.
@@ -362,6 +357,9 @@ func (d *DiskKV) queryAppliedIndex(db *pebbledb) (uint64, error) {
 	if len(val) == 0 {
 		return 0, nil
 	}
+	if len(val) != 8 {
+		return 0, errors.New("invalid stored applied index")
+	}
 	return binary.LittleEndian.Uint64(val), nil
 }
 
@@ -400,11 +398,16 @@ func (d *DiskKV) Open(stopc <-chan struct{}) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	atomic.SwapPointer(&d.db, unsafe.Pointer(db))
 	appliedIndex, err := d.queryAppliedIndex(db)
 	if err != nil {
-		panic(err)
+		db.close()
+		return 0, err
 	}
+	if err := validateDiskTransactions(db.db, d.clusterID); err != nil {
+		db.close()
+		return 0, err
+	}
+	atomic.SwapPointer(&d.db, unsafe.Pointer(db))
 	d.lastApplied = appliedIndex
 	return appliedIndex, nil
 }
@@ -415,18 +418,49 @@ func (d *DiskKV) Lookup(key interface{}) (interface{}, error) {
 	if db != nil {
 		// Full-state scan (used by the CM for state handoff between regions).
 		if sq, ok := key.(*ScanQuery); ok {
-			return db.scan(sq.Limit)
+			result, err := db.scan(sq.Limit)
+			if err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		if db.closed {
+			return nil, errors.New("db already closed")
+		}
+		switch query := key.(type) {
+		case *TxnQuery:
+			return diskTransactionReply(db.db, query.ID)
+		case TxnQuery:
+			return diskTransactionReply(db.db, query.ID)
+		case *PendingTxnQuery, PendingTxnQuery:
+			return diskPendingTransactions(db.db)
 		}
 		// Key + version lookup (freshest-copy selection across regions).
 		if kq, ok := key.(*KeyQuery); ok {
-			v, err := db.lookup([]byte(kq.Key))
+			if !validUserKey(kq.Key) {
+				return nil, errors.New("invalid user key")
+			}
+			owner, err := (diskParticipantStore{reader: db.db}).lockOwner(kq.Key)
+			if err != nil {
+				return nil, err
+			}
+			if owner != "" {
+				return nil, &PendingTxnError{ID: owner}
+			}
+			v, closer, err := db.db.Get([]byte(kq.Key))
 			if err == pebble.ErrNotFound {
 				return &KVResult{Found: false}, nil
 			}
 			if err != nil {
 				return nil, err
 			}
-			ver, _ := db.getVersion(kq.Key, nil)
+			defer closer.Close()
+			ver, err := db.getVersion(kq.Key, nil)
+			if err != nil {
+				return nil, err
+			}
 			return &KVResult{Found: true, Val: string(v), Ver: ver}, nil
 		}
 		var kb []byte
@@ -438,14 +472,27 @@ func (d *DiskKV) Lookup(key interface{}) (interface{}, error) {
 		default:
 			return nil, errors.New("query must be []byte or string")
 		}
-		v, err := db.lookup(kb)
-		if err == nil && d.closed {
-			panic("lookup returned valid result when DiskKV is already closed")
+		if !validUserKey(string(kb)) {
+			return nil, errors.New("invalid user key")
 		}
+		owner, err := (diskParticipantStore{reader: db.db}).lockOwner(string(kb))
+		if err != nil {
+			return nil, err
+		}
+		if owner != "" {
+			return nil, &PendingTxnError{ID: owner}
+		}
+		v, closer, err := db.db.Get(kb)
 		if err == pebble.ErrNotFound {
-			return v, nil
+			return []byte(nil), nil
 		}
-		return v, err
+		if err != nil {
+			return nil, err
+		}
+		defer closer.Close()
+		value := make([]byte, len(v))
+		copy(value, v)
+		return value, nil
 	}
 	return nil, errors.New("db closed")
 }
@@ -463,32 +510,46 @@ func (d *DiskKV) Update(ents []sm.Entry) ([]sm.Entry, error) {
 	if d.closed {
 		panic("update called after Close()")
 	}
+	if len(ents) == 0 {
+		return ents, nil
+	}
 	db := (*pebbledb)(atomic.LoadPointer(&d.db))
-	wb := db.db.NewBatch()
+	if db == nil {
+		return nil, errors.New("db closed")
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, errors.New("db closed")
+	}
+	wb := db.db.NewIndexedBatch()
 	defer wb.Close()
+	store := diskParticipantStore{reader: wb, batch: wb}
 	for idx, e := range ents {
-		dataKV := &KVData{}
-		if err := json.Unmarshal(e.Cmd, dataKV); err != nil {
-			panic(err)
+		txn, kv, err := decodeReplicatedCommand(e.Cmd)
+		if err != nil {
+			ents[idx].Result = rejectTxn(err.Error())
+			continue
 		}
-		if dataKV.Ver > 0 {
-			// version-aware last-writer-wins (see KVData.Ver)
-			cur, err := db.getVersion(dataKV.Key, wb)
-			if err == nil && cur >= dataKV.Ver {
-				ents[idx].Result = sm.Result{Value: 0}
-				continue
+		if txn != nil {
+			ents[idx].Result, err = applyParticipantCommand(store, d.clusterID, *txn)
+		} else {
+			var applied bool
+			applied, ents[idx].Result, err = applyLegacyWrite(store, *kv)
+			if applied {
+				ents[idx].Result = sm.Result{Value: uint64(len(e.Cmd))}
 			}
-			vb := make([]byte, 8)
-			binary.LittleEndian.PutUint64(vb, dataKV.Ver)
-			wb.Set([]byte(verKeyPrefix+dataKV.Key), vb, db.wo)
 		}
-		wb.Set([]byte(dataKV.Key), []byte(dataKV.Val), db.wo)
-		ents[idx].Result = sm.Result{Value: uint64(len(ents[idx].Cmd))}
+		if err != nil {
+			return nil, err
+		}
 	}
 	// save the applied index to the DB.
 	appliedIndex := make([]byte, 8)
 	binary.LittleEndian.PutUint64(appliedIndex, ents[len(ents)-1].Index)
-	wb.Set([]byte(appliedIndexKey), appliedIndex, db.wo)
+	if err := wb.Set([]byte(appliedIndexKey), appliedIndex, db.wo); err != nil {
+		return nil, err
+	}
 	if err := db.db.Apply(wb, db.syncwo); err != nil {
 		return nil, err
 	}
@@ -533,19 +594,31 @@ func iteratorIsValid(iter *pebble.Iterator) bool {
 	return iter.Valid()
 }
 
+// Bytes preserves binary index/version metadata through JSON snapshots. Val
+// accepts the older snapshot format; new snapshots never encode raw bytes as
+// a string, where invalid UTF-8 would otherwise be replaced irreversibly.
+type diskSnapshotEntry struct {
+	Key   string
+	Val   string `json:",omitempty"`
+	Bytes []byte `json:"bytes,omitempty"`
+}
+
 // saveToWriter saves all existing key-value pairs to the provided writer.
 // As an example, we use the most straight forward way to implement this.
 func (d *DiskKV) saveToWriter(db *pebbledb,
 	ss *pebble.Snapshot, w io.Writer) error {
 	iter := ss.NewIter(db.ro)
 	defer iter.Close()
-	values := make([]*KVData, 0)
+	values := make([]*diskSnapshotEntry, 0)
 	for iter.First(); iteratorIsValid(iter); iter.Next() {
-		kv := &KVData{
-			Key: string(iter.Key()),
-			Val: string(iter.Value()),
+		kv := &diskSnapshotEntry{
+			Key:   string(iter.Key()),
+			Bytes: append([]byte(nil), iter.Value()...),
 		}
 		values = append(values, kv)
+	}
+	if err := iter.Error(); err != nil {
+		return err
 	}
 	count := uint64(len(values))
 	sz := make([]byte, 8)
@@ -607,6 +680,16 @@ func (d *DiskKV) RecoverFromSnapshot(r io.Reader,
 	if err != nil {
 		return err
 	}
+	installed := false
+	keepDBDir := false
+	defer func() {
+		if !installed {
+			db.close()
+			if !keepDBDir {
+				os.RemoveAll(dbdir)
+			}
+		}
+	}()
 	sz := make([]byte, 8)
 	if _, err := io.ReadFull(r, sz); err != nil {
 		return err
@@ -623,34 +706,47 @@ func (d *DiskKV) RecoverFromSnapshot(r io.Reader,
 		if _, err := io.ReadFull(r, data); err != nil {
 			return err
 		}
-		dataKv := &KVData{}
+		dataKv := &diskSnapshotEntry{}
 		if err := json.Unmarshal(data, dataKv); err != nil {
-			panic(err)
+			return err
 		}
-		wb.Set([]byte(dataKv.Key), []byte(dataKv.Val), db.wo)
+		value := dataKv.Bytes
+		if value == nil {
+			value = []byte(dataKv.Val)
+		}
+		if err := wb.Set([]byte(dataKv.Key), value, db.wo); err != nil {
+			return err
+		}
 	}
 	if err := db.db.Apply(wb, db.syncwo); err != nil {
 		return err
 	}
+	newLastApplied, err := d.queryAppliedIndex(db)
+	if err != nil {
+		return err
+	}
+	if d.lastApplied > newLastApplied {
+		return errors.New("snapshot applied index moves backwards")
+	}
+	if err := validateDiskTransactions(db.db, d.clusterID); err != nil {
+		return err
+	}
+	// Once updating the directory pointer, retain the valid new DB even if
+	// directory fsync fails after the rename; startup may already reference it.
+	keepDBDir = true
 	if err := saveCurrentDBDirName(dir, dbdir); err != nil {
 		return err
 	}
 	if err := replaceCurrentDBFile(dir); err != nil {
 		return err
 	}
-	newLastApplied, err := d.queryAppliedIndex(db)
-	if err != nil {
-		panic(err)
-	}
 	// when d.lastApplied == newLastApplied, it probably means there were some
 	// dummy entries or membership change entries as part of the new snapshot
 	// that never reached the SM and thus never moved the last applied index
 	// in the SM snapshot.
-	if d.lastApplied > newLastApplied {
-		panic("last applied not moving forward")
-	}
 	d.lastApplied = newLastApplied
 	old := (*pebbledb)(atomic.SwapPointer(&d.db, unsafe.Pointer(db)))
+	installed = true
 	if old != nil {
 		old.close()
 	}

@@ -9,10 +9,13 @@ MR-Raft gRPC Bridge
 
 import time
 import asyncio
+import itertools
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
+
+_request_ids = itertools.count(time.time_ns())
 
 
 class NodeRole(Enum):
@@ -30,6 +33,7 @@ class RequestResult:
     region_id: int = -1
     was_forwarded: bool = False  # 是否被转发到 leader
     timestamp_ms: float = 0.0
+    request_id: int = 0
 
 
 @dataclass
@@ -195,7 +199,9 @@ class MRRaftClient:
     async def propose(self, node_id: int, region_id: int, 
                       data: bytes = b"test",
                       is_handover_window: bool = False,
-                      leader_count_diff: int = 0) -> RequestResult:
+                      leader_count_diff: int = 0,
+                      client_id: int = 1,
+                      request_id: Optional[int] = None) -> RequestResult:
         """
         发送 Propose 请求
         
@@ -211,19 +217,28 @@ class MRRaftClient:
             是否在 handover 窗口内
         leader_count_diff : int
             leader 数量差异
+        client_id : int
+            非零客户端 ID；重试时保持不变
+        request_id : Optional[int]
+            新写入默认生成 ID；结果不确定时用返回的 ID、相同节点和数据重试
         """
         timestamp = time.time() * 1000
+        if request_id is None:
+            request_id = next(_request_ids)
         
         if self.mode == "simulated":
             return await self._propose_simulated(
-                node_id, region_id, is_handover_window, leader_count_diff, timestamp)
+                node_id, region_id, is_handover_window, leader_count_diff, timestamp,
+                request_id)
         else:
-            return await self._propose_real(node_id, region_id, data, timestamp)
+            return await self._propose_real(node_id, region_id, data, timestamp,
+                                            client_id, request_id)
     
     async def _propose_simulated(self, node_id: int, region_id: int,
                                   is_handover_window: bool,
                                   leader_count_diff: int,
-                                  timestamp: float) -> RequestResult:
+                                  timestamp: float,
+                                  request_id: int = 0) -> RequestResult:
         """模拟模式的 Propose（不真实等待，直接返回采样延迟）"""
         # 判断当前节点是否是该 region 的 leader
         is_leader = region_id in self.leader_map.get(node_id, [])
@@ -243,11 +258,17 @@ class MRRaftClient:
             region_id=region_id,
             was_forwarded=not is_leader,
             timestamp_ms=timestamp,
+            request_id=request_id,
         )
     
     async def _propose_real(self, node_id: int, region_id: int,
-                            data: bytes, timestamp: float) -> RequestResult:
+                            data: bytes, timestamp: float,
+                            client_id: int = 1,
+                            request_id: Optional[int] = None) -> RequestResult:
         """真实模式的 Propose"""
+        if request_id is None:
+            request_id = next(_request_ids)
+        start = time.perf_counter()
         try:
             from .proto import raft_service_pb2 as pb
             
@@ -257,17 +278,16 @@ class MRRaftClient:
                     success=False, latency_ms=0,
                     error=f"No connection to node {node_id}",
                     node_id=node_id, region_id=region_id,
-                    timestamp_ms=timestamp)
+                    timestamp_ms=timestamp, request_id=request_id)
             
-            start = time.time()
             request = pb.ProposeRequest(
                 region_id=region_id,
                 data=data,
-                client_id=1,
-                request_id=int(timestamp * 1000),
+                client_id=client_id,
+                request_id=request_id,
             )
             response = await stub.Propose(request, timeout=5.0)
-            latency = (time.time() - start) * 1000
+            latency = (time.perf_counter() - start) * 1000
             
             return RequestResult(
                 success=response.success,
@@ -277,13 +297,14 @@ class MRRaftClient:
                 region_id=region_id,
                 was_forwarded=False,  # 无法从响应中判断
                 timestamp_ms=timestamp,
+                request_id=request_id,
             )
         except Exception as e:
-            latency = (time.time() - start) * 1000 if 'start' in dir() else 0
+            latency = (time.perf_counter() - start) * 1000
             return RequestResult(
                 success=False, latency_ms=latency,
                 error=str(e), node_id=node_id, region_id=region_id,
-                timestamp_ms=timestamp)
+                timestamp_ms=timestamp, request_id=request_id)
     
     async def get_status(self, node_id: int) -> NodeStatus:
         """获取节点状态"""

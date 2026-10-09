@@ -8,6 +8,7 @@ timestamps easy to reason about.
 """
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
@@ -16,6 +17,10 @@ import grpc
 
 from ..simulation.proto import raft_service_pb2 as pb
 from ..simulation.proto import raft_service_pb2_grpc as pb_grpc
+
+# Fresh writes get distinct int64 IDs, including concurrent workload workers.
+# Keep the returned ID when retrying an outcome that has not been confirmed.
+_request_ids = itertools.count(time.time_ns())
 
 # Directive op names (mirror proto enum) -----------------------------------
 START_REGION = pb.START_REGION
@@ -90,6 +95,7 @@ class ProposeOutcome:
     latency_ms: float
     error: str = ""
     result_index: int = 0
+    request_id: int = 0
 
 
 @dataclass
@@ -189,8 +195,16 @@ class NodeClient:
 
     # -- data plane ---------------------------------------------------------
     def propose(self, key: str, val: str, region_id: int = 0, client_id: int = 1,
-                request_id: int = 0, timeout_s: float = 6.0, ver: int = 0) -> ProposeOutcome:
-        """ver > 0 enables version-aware last-writer-wins in the state machine."""
+                request_id: Optional[int] = None, timeout_s: float = 6.0, ver: int = 0) -> ProposeOutcome:
+        """Submit one 2PC write; retry with the same node, client and request ID.
+
+        Omitted request IDs are generated for fresh writes and returned in the
+        outcome, even on RPC errors. Explicit zero is a valid stable request ID.
+        Use a nonzero client ID for retries. A new transaction with Ver > 0 is
+        rejected if any participant already holds that version or a newer one.
+        """
+        if request_id is None:
+            request_id = next(_request_ids)
         if ver > 0:
             data = ('{"Key":%s,"Val":%s,"Ver":%d}' % (_json_str(key), _json_str(val), ver)).encode()
         else:
@@ -201,10 +215,12 @@ class NodeClient:
             resp = self.stub.Propose(req, timeout=timeout_s)
             lat = (time.perf_counter() - t0) * 1000
             return ProposeOutcome(success=resp.success, latency_ms=lat,
-                                  error=resp.error, result_index=resp.result_index)
+                                  error=resp.error, result_index=resp.result_index,
+                                  request_id=request_id)
         except grpc.RpcError as e:
             lat = (time.perf_counter() - t0) * 1000
-            return ProposeOutcome(success=False, latency_ms=lat, error=_rpc_err(e))
+            return ProposeOutcome(success=False, latency_ms=lat, error=_rpc_err(e),
+                                  request_id=request_id)
 
     def sync_read(self, key: str, region_id: int = 0, stale: bool = False,
                   timeout_s: float = 6.0) -> ReadOutcome:

@@ -14,15 +14,16 @@
 //     can decompose T_trans = T_batch + T_part + T_cfg + T_joint.
 //
 // Env vars (all optional except MEC_NODE_ID):
-//   MEC_NODE_ID, MEC_NODE_NAME, MEC_NODE_ADDRESS (raft addr), GRPC_PORT,
-//   MEC_NODE_DATA_DIR, USE_MEMORY_SM (true/false),
-//   RAFT_TICK_MS (50), ELECTION_RTT (3), HEARTBEAT_RTT (1), CHECK_QUORUM (true),
-//   SNAPSHOT_ENTRIES (10000), COMPACTION_OVERHEAD (5000),
-//   PROPOSE_TIMEOUT_MS (5000), DRAIN_TIMEOUT_MS (500),
-//   NETWORK_DELAY_US / NETWORK_DELAY_MS (raft transport delay injection),
-//   EVENT_LOG (path of JSONL event log),
-//   MEC_NODE_REGIONS + CLUSTER_MEMBERS_<rid> (optional static bootstrap, same
-//   format as the legacy binary; raft node id = rid*100 + node id).
+//
+//	MEC_NODE_ID, MEC_NODE_NAME, MEC_NODE_ADDRESS (raft addr), GRPC_PORT,
+//	MEC_NODE_DATA_DIR, USE_MEMORY_SM (true/false),
+//	RAFT_TICK_MS (50), ELECTION_RTT (3), HEARTBEAT_RTT (1), CHECK_QUORUM (true),
+//	SNAPSHOT_ENTRIES (10000), COMPACTION_OVERHEAD (5000),
+//	PROPOSE_TIMEOUT_MS (5000), DRAIN_TIMEOUT_MS (500),
+//	NETWORK_DELAY_US / NETWORK_DELAY_MS (raft transport delay injection),
+//	EVENT_LOG (path of JSONL event log),
+//	MEC_NODE_REGIONS + CLUSTER_MEMBERS_<rid> (optional static bootstrap, same
+//	format as the legacy binary; raft node id = rid*100 + node id).
 package main
 
 import (
@@ -43,13 +44,13 @@ import (
 	"time"
 
 	"gitcode.com/lpray/multi-region-raft/pkg/mec"
+	"gitcode.com/lpray/multi-region-raft/pkg/twopc"
 	pb "gitcode.com/lpray/multi-region-raft/proto/raftservice"
 	"github.com/lni/dragonboat/v3"
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-	gvfs "github.com/lni/goutils/vfs"
 	"google.golang.org/grpc"
 )
 
@@ -58,12 +59,15 @@ import (
 // ---------------------------------------------------------------------------
 
 type regionEntry struct {
-	regionID   uint64
-	raftNodeID uint64            // this node's raft node id inside the region
-	members    map[uint64]string // last known members (raft node id -> addr)
-	inflight   int64             // in-flight data-plane requests
-	fenced     int32             // 1: no longer serving data-plane requests (leaving the region)
-	startedAt  time.Time
+	regionID             uint64
+	raftNodeID           uint64            // this node's raft node id inside the region
+	members              map[uint64]string // last known members (raft node id -> addr)
+	inflight             int64             // in-flight data-plane requests
+	fenced               int32             // 1: no longer serving data-plane requests (leaving the region)
+	startedAt            time.Time
+	appliedMembership    appliedMembershipReader // retained local Raft membership evidence
+	fenceVerified        int32                   // successful drain and pending-state check in this process
+	fenceMembershipIndex uint64                  // applied membership before that check
 }
 
 // ---------------------------------------------------------------------------
@@ -80,15 +84,16 @@ type MECNodeCM struct {
 	DataDir     string
 	UseMemorySM bool
 
-	TickMs             uint64
-	ElectionRTT        uint64
-	HeartbeatRTT       uint64
-	CheckQuorum        bool
-	SnapshotEntries    uint64
-	CompactionOverhead uint64
-	ProposeTimeout     time.Duration
-	DrainTimeout       time.Duration
-	NetworkDelay       time.Duration
+	TickMs              uint64
+	ElectionRTT         uint64
+	HeartbeatRTT        uint64
+	CheckQuorum         bool
+	SnapshotEntries     uint64
+	CompactionOverhead  uint64
+	ProposeTimeout      time.Duration
+	DrainTimeout        time.Duration
+	NetworkDelay        time.Duration
+	TxnRecoveryInterval time.Duration
 
 	NodeHost   *dragonboat.NodeHost
 	grpcServer *grpc.Server
@@ -97,7 +102,10 @@ type MECNodeCM struct {
 	regions map[uint64]*regionEntry // active (serving) regions
 	version uint64                  // last applied CM config version
 
-	cfgMu sync.Mutex // serializes ApplyConfig calls
+	cfgMu      sync.Mutex // serializes ApplyConfig calls
+	txns       *twopc.Engine
+	txnCancel  context.CancelFunc
+	txnWorkers sync.WaitGroup
 
 	stats    *proposeStats
 	eventLog *eventLogger
@@ -231,6 +239,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer n.NodeHost.Stop()
+	if err := n.initTransactions(); err != nil {
+		fmt.Printf("❌ 打开事务协调日志失败: %v\n", err)
+		n.NodeHost.Stop()
+		n.eventLog.close()
+		os.Exit(1)
+	}
+	defer n.closeTransactions()
 
 	if err := n.bootstrapStaticRegions(); err != nil {
 		fmt.Printf("❌ 静态 region 启动失败: %v\n", err)
@@ -280,6 +295,10 @@ func (n *MECNodeCM) loadConfigFromEnv() error {
 	n.CompactionOverhead = uint64(getEnvInt("COMPACTION_OVERHEAD", 5000))
 	n.ProposeTimeout = time.Duration(getEnvInt("PROPOSE_TIMEOUT_MS", 5000)) * time.Millisecond
 	n.DrainTimeout = time.Duration(getEnvInt("DRAIN_TIMEOUT_MS", 500)) * time.Millisecond
+	n.TxnRecoveryInterval = time.Duration(getEnvInt("TX_RECOVERY_INTERVAL_MS", 500)) * time.Millisecond
+	if n.ProposeTimeout <= 0 || n.DrainTimeout <= 0 || n.TxnRecoveryInterval <= 0 {
+		return fmt.Errorf("request, drain and transaction recovery intervals must be positive")
+	}
 
 	if n.ElectionRTT <= 2*n.HeartbeatRTT {
 		return fmt.Errorf("dragonboat 要求 ELECTION_RTT > 2*HEARTBEAT_RTT (got %d, %d)", n.ElectionRTT, n.HeartbeatRTT)
@@ -309,6 +328,9 @@ func (n *MECNodeCM) raftConfig(regionID, raftNodeID uint64) config.Config {
 }
 
 func (n *MECNodeCM) createNodeHost() error {
+	if getEnv("RAFT_MEMFS", "false") == "true" {
+		return errors.New("2PC requires persistent participant Raft logs; RAFT_MEMFS must be false")
+	}
 	dataDir := filepath.Join(n.DataDir, n.NodeName)
 	nhc := config.NodeHostConfig{
 		WALDir:            filepath.Join(dataDir, "wal"),
@@ -319,14 +341,6 @@ func (n *MECNodeCM) createNodeHost() error {
 	}
 	if n.NetworkDelay > 0 {
 		nhc.Expert.TransportFactory = &DelayTransportFactory{Delay: n.NetworkDelay}
-	}
-	// RAFT_MEMFS=true keeps the Raft WAL/LogDB in memory. Intended for local
-	// functional runs on laptops where per-entry fsync (macOS F_FULLFSYNC
-	// ~10-20 ms) stalls the Raft step loop and triggers spurious elections at
-	// the paper's 50 ms tick; production/server runs should keep the default.
-	if getEnv("RAFT_MEMFS", "false") == "true" {
-		nhc.Expert.FS = gvfs.NewStrictMem()
-		fmt.Printf("  Raft 日志: 内存文件系统 (RAFT_MEMFS=true)\n")
 	}
 	nh, err := dragonboat.NewNodeHost(nhc)
 	if err != nil {
@@ -416,14 +430,29 @@ func (n *MECNodeCM) servingRegion(rid uint64) (*regionEntry, bool) {
 // before REMOVE_MEMBER guarantees that no request of this node is pending at
 // the leader when the leader stops talking to it.
 func (n *MECNodeCM) fenceRegion(rid uint64) error {
-	e, ok := n.getRegion(rid)
+	n.mu.Lock()
+	e, ok := n.regions[rid]
 	if !ok {
+		n.mu.Unlock()
 		return nil // idempotent (already stopped)
 	}
 	atomic.StoreInt32(&e.fenced, 1)
-	deadline := time.Now().Add(n.DrainTimeout)
-	for atomic.LoadInt64(&e.inflight) > 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	n.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), n.drainTimeout())
+	defer cancel()
+	if err := waitRegionDrain(ctx, e); err != nil {
+		return err
+	}
+	var before *dragonboat.Membership
+	if e.appliedMembership != nil {
+		before = e.appliedMembership.AppliedMembership()
+	}
+	if err := n.ensureRegionResolved(ctx, rid); err != nil {
+		return err
+	}
+	if n.txns != nil && before != nil && localReplicaPresent(before, e.raftNodeID) {
+		atomic.StoreUint64(&e.fenceMembershipIndex, before.ConfigChangeID)
+		atomic.StoreInt32(&e.fenceVerified, 1)
 	}
 	return nil
 }
@@ -463,8 +492,12 @@ func (n *MECNodeCM) startRegion(rid, self uint64, members map[uint64]string,
 		return 0, err
 	}
 	register := func() {
+		var membership appliedMembershipReader
+		if user, userErr := n.NodeHost.GetNodeUser(rid); userErr == nil && user.NodeID() == self {
+			membership, _ = user.(appliedMembershipReader)
+		}
 		n.mu.Lock()
-		n.regions[rid] = &regionEntry{regionID: rid, raftNodeID: self, members: members, startedAt: time.Now()}
+		n.regions[rid] = &regionEntry{regionID: rid, raftNodeID: self, members: members, startedAt: time.Now(), appliedMembership: membership}
 		n.mu.Unlock()
 	}
 	if !waitLeader {
@@ -489,30 +522,32 @@ func (n *MECNodeCM) startRegion(rid, self uint64, members map[uint64]string,
 	return time.Since(t0), fmt.Errorf("region %d: leader not elected within %v", rid, timeout)
 }
 
-// stopRegion drains in-flight requests, then stops the Raft instance and
-// removes its on-disk data.
+// stopRegion never discards transaction state. A region remains hosted (but
+// fenced) when preparation/decision delivery is unresolved; the CM must retry.
 func (n *MECNodeCM) stopRegion(rid uint64) error {
-	n.mu.Lock()
-	e, ok := n.regions[rid]
-	if ok {
-		delete(n.regions, rid) // new requests no longer target this region
-	}
-	n.mu.Unlock()
-	if !ok {
-		return nil // idempotent
-	}
-	deadline := time.Now().Add(n.DrainTimeout)
-	for atomic.LoadInt64(&e.inflight) > 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if err := n.NodeHost.StopCluster(rid); err != nil && !errors.Is(err, dragonboat.ErrClusterNotFound) {
+	if err := n.fenceRegion(rid); err != nil {
 		return err
 	}
-	// Best effort cleanup; ignore errors (e.g. data already removed).
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		_ = n.NodeHost.RemoveData(rid, e.raftNodeID)
-	}()
+	n.mu.Lock()
+	e, ok := n.regions[rid]
+	if !ok {
+		n.mu.Unlock()
+		return nil
+	}
+	if atomic.LoadInt64(&e.inflight) != 0 {
+		n.mu.Unlock()
+		return fmt.Errorf("region %d still has in-flight transaction work", rid)
+	}
+	delete(n.regions, rid)
+	n.mu.Unlock()
+	if err := n.NodeHost.StopCluster(rid); err != nil && !errors.Is(err, dragonboat.ErrClusterNotFound) {
+		n.mu.Lock()
+		n.regions[rid] = e
+		n.mu.Unlock()
+		return err
+	}
+	// Retain WAL/snapshots and transaction tombstones. Storage reclamation
+	// requires an explicit retention policy after state handoff, not a timer.
 	return nil
 }
 
@@ -596,6 +631,9 @@ func (n *MECNodeCM) membershipChange(ctx context.Context, rid, target uint64,
 // for 150-300 ms and strand in-flight ReadIndex requests until they time out.
 // Returns the time spent waiting for the transfer.
 func (n *MECNodeCM) removeMember(ctx context.Context, rid, target uint64) (time.Duration, error) {
+	if err := n.ensureRegionResolved(ctx, rid); err != nil {
+		return 0, err
+	}
 	e, ok := n.getRegion(rid)
 	if !ok {
 		return 0, fmt.Errorf("region %d not hosted on node %d", rid, n.NodeID)
@@ -622,14 +660,13 @@ func (n *MECNodeCM) removeMember(ctx context.Context, rid, target uint64) (time.
 
 // migrateState re-proposes every KV pair of the local src region into dst.
 func (n *MECNodeCM) migrateState(ctx context.Context, src, dst uint64) (uint32, error) {
-	if _, ok := n.getRegion(src); !ok {
-		return 0, fmt.Errorf("src region %d not hosted", src)
+	entries, err := n.acquireRegionIDs([]uint64{src, dst}, true)
+	if err != nil {
+		return 0, err
 	}
-	if _, ok := n.getRegion(dst); !ok {
-		return 0, fmt.Errorf("dst region %d not hosted", dst)
-	}
+	defer releaseRegions(entries)
 	rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	res, err := n.NodeHost.SyncRead(rctx, src, &mec.ScanQuery{})
+	res, err := n.readRegion(rctx, src, &mec.ScanQuery{}, false)
 	cancel()
 	if err != nil {
 		return 0, fmt.Errorf("scan src %d: %v", src, err)
@@ -657,7 +694,13 @@ func (n *MECNodeCM) migrateState(ctx context.Context, src, dst uint64) (uint32, 
 			defer func() { <-sem }()
 			pctx, pcancel := context.WithTimeout(ctx, n.ProposeTimeout)
 			defer pcancel()
-			if _, err := n.NodeHost.SyncPropose(pctx, session, p); err != nil {
+			result, err := n.NodeHost.SyncPropose(pctx, session, p)
+			if err == nil && len(result.Data) > 0 {
+				if reply, decodeErr := mec.DecodeTxnReply(result); decodeErr == nil && reply.State == mec.TxnRejected {
+					err = fmt.Errorf("destination rejected migration: %s", reply.Error)
+				}
+			}
+			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -685,10 +728,19 @@ func (n *MECNodeCM) ApplyConfig(ctx context.Context, req *pb.ApplyConfigRequest)
 	}
 	batchStart := time.Now()
 	results := make([]*pb.DirectiveResult, 0, len(req.Directives))
+	failed := false
 	for _, d := range req.Directives {
-		results = append(results, n.applyDirective(ctx, req.Version, d))
+		if failed {
+			results = append(results, &pb.DirectiveResult{Op: d.Op, RegionId: d.RegionId, Success: false, Error: "skipped after an earlier directive failed; retry this configuration"})
+			continue
+		}
+		result := n.applyDirective(ctx, req.Version, d)
+		results = append(results, result)
+		failed = !result.Success
 	}
-	atomic.StoreUint64(&n.version, req.Version)
+	if !failed {
+		atomic.StoreUint64(&n.version, req.Version)
+	}
 	return &pb.ApplyConfigResponse{
 		Version:       req.Version,
 		Results:       results,
@@ -793,12 +845,14 @@ func (n *MECNodeCM) GetMembership(ctx context.Context, req *pb.MembershipRequest
 }
 
 func (n *MECNodeCM) ScanRegion(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
-	if _, ok := n.getRegion(req.RegionId); !ok {
-		return &pb.ScanResponse{Success: false, Error: fmt.Sprintf("region %d not hosted", req.RegionId)}, nil
+	entries, err := n.acquireRegionIDs([]uint64{req.RegionId}, true)
+	if err != nil {
+		return &pb.ScanResponse{Success: false, Error: err.Error()}, nil
 	}
+	defer releaseRegions(entries)
 	rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	res, err := n.NodeHost.SyncRead(rctx, req.RegionId, &mec.ScanQuery{Limit: int(req.Limit)})
+	res, err := n.readRegion(rctx, req.RegionId, &mec.ScanQuery{Limit: int(req.Limit)}, false)
 	if err != nil {
 		return &pb.ScanResponse{Success: false, Error: err.Error()}, nil
 	}
@@ -813,186 +867,63 @@ func (n *MECNodeCM) ScanRegion(ctx context.Context, req *pb.ScanRequest) (*pb.Sc
 // Data-plane RPCs
 // ---------------------------------------------------------------------------
 
-// Propose replicates the request to all regions this node currently belongs to
-// (region_id == 0) or to one specific region; succeeds only if every target
-// region commits (cross-region atomic commitment, Sec. IV-B.5).
+// Propose coordinates durable two-phase commit for the fixed target-region set.
 func (n *MECNodeCM) Propose(ctx context.Context, req *pb.ProposeRequest) (*pb.ProposeResponse, error) {
-	var data mec.KVData
-	if err := json.Unmarshal(req.Data, &data); err != nil || data.Key == "" {
-		data = mec.KVData{Key: fmt.Sprintf("key-%d-%d", req.ClientId, req.RequestId), Val: string(req.Data)}
-	}
-	payload, err := json.Marshal(data)
-	if err != nil {
-		atomic.AddUint64(&n.stats.total, 1)
-		atomic.AddUint64(&n.stats.failed, 1)
-		return nil, fmt.Errorf("序列化失败: %v", err)
-	}
-
-	var targets []*regionEntry
-	if req.RegionId != 0 {
-		e, ok := n.servingRegion(req.RegionId)
-		if !ok {
-			atomic.AddUint64(&n.stats.total, 1)
-			atomic.AddUint64(&n.stats.failed, 1)
-			return nil, fmt.Errorf("region %d not served on node %d", req.RegionId, n.NodeID)
-		}
-		targets = []*regionEntry{e}
-	} else {
-		targets = n.activeRegions()
-	}
-	atomic.AddUint64(&n.stats.total, 1)
-	if len(targets) == 0 {
-		atomic.AddUint64(&n.stats.failed, 1)
-		return nil, fmt.Errorf("node %d hosts no region", n.NodeID)
-	}
-
-	pctx, cancel := context.WithTimeout(ctx, n.ProposeTimeout)
-	defer cancel()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make(map[uint64]sm.Result, len(targets))
-	failures := make(map[uint64]error)
-	for _, e := range targets {
-		wg.Add(1)
-		atomic.AddInt64(&e.inflight, 1)
-		go func(e *regionEntry) {
-			defer wg.Done()
-			defer atomic.AddInt64(&e.inflight, -1)
-			session := n.NodeHost.GetNoOPSession(e.regionID)
-			cs, err := n.NodeHost.SyncPropose(pctx, session, payload)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				if errors.Is(err, dragonboat.ErrClusterClosed) || errors.Is(err, dragonboat.ErrClusterNotFound) {
-					atomic.AddUint64(&n.stats.closedRegionFailures, 1)
-				}
-				failures[e.regionID] = err
-				return
-			}
-			results[e.regionID] = cs
-		}(e)
-	}
-	wg.Wait()
-	lat := time.Since(start)
-
-	if len(failures) == 0 {
-		atomic.AddUint64(&n.stats.success, 1)
-		if c := atomic.AddUint64(&n.stats.sampleCounter, 1); c%10 == 0 {
-			n.stats.mu.Lock()
-			if len(n.stats.samples) < cap(n.stats.samples) {
-				n.stats.samples = append(n.stats.samples, lat)
-			}
-			n.stats.mu.Unlock()
-		}
-		var any sm.Result
-		for _, r := range results {
-			any = r
-			break
-		}
-		return &pb.ProposeResponse{Success: true, LatencyUs: lat.Microseconds(), RequestId: req.RequestId, ResultIndex: any.Value}, nil
-	}
-	atomic.AddUint64(&n.stats.failed, 1)
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Propose失败: %d/%d regions失败: ", len(failures), len(targets))
-	for rid, ferr := range failures {
-		fmt.Fprintf(&sb, "[%d: %v] ", rid, ferr)
-	}
-	return nil, errors.New(sb.String())
+	return n.proposeTransaction(ctx, req)
 }
 
-// SyncRead reads a key from the node's regions (ReadIndex linearizable read by
-// default, local StaleRead when req.Stale is set).
+// SyncRead never exposes a prepared value. Pending transactions wait within the
+// request budget, and a failed regional read yields no partial user values.
 func (n *MECNodeCM) SyncRead(ctx context.Context, req *pb.SyncReadRequest) (*pb.SyncReadResponse, error) {
 	start := time.Now()
-	var targets []*regionEntry
-	if req.RegionId != 0 {
-		if e, ok := n.servingRegion(req.RegionId); ok {
-			targets = []*regionEntry{e}
-		}
-	} else {
-		targets = n.activeRegions()
+	targets, err := n.acquireServingRegions(req.RegionId)
+	if err != nil {
+		return &pb.SyncReadResponse{Error: err.Error()}, nil
 	}
-	regionValues := make(map[uint64]string)
+	defer releaseRegions(targets)
+	type regionalResult struct {
+		rid   uint64
+		value interface{}
+		err   error
+	}
+	results := make(chan regionalResult, len(targets))
+	rctx, cancel := context.WithTimeout(ctx, n.requestTimeout())
+	defer cancel()
+	for _, e := range targets {
+		go func(rid uint64) {
+			value, err := n.readRegion(rctx, rid, &mec.KeyQuery{Key: req.Key}, req.Stale)
+			results <- regionalResult{rid, value, err}
+		}(e.regionID)
+	}
+	values := make(map[uint64]string)
 	var failures []string
 	var bestVer uint64
 	var bestVal string
 	found := false
-	query := &mec.KeyQuery{Key: req.Key}
-	// Read the regions concurrently; a node in several regions returns the
-	// freshest committed copy (highest version) among them. That claim only
-	// holds if *every* region answered: a region that could not be read (e.g.
-	// momentarily leaderless) is retried within the request budget, and if it
-	// still fails the whole read fails instead of silently returning a
-	// possibly older copy from the other regions. Regions closed concurrently
-	// by a STOP_REGION are simply skipped (their state has been handed off).
-	type rres struct {
-		rid uint64
-		res interface{}
-		err error
-	}
-	results := make(chan rres, len(targets))
-	rctx, rcancel := context.WithTimeout(ctx, n.ProposeTimeout)
-	defer rcancel()
-	for _, e := range targets {
-		atomic.AddInt64(&e.inflight, 1)
-		go func(e *regionEntry) {
-			defer atomic.AddInt64(&e.inflight, -1)
-			var result interface{}
-			var err error
-			if req.Stale {
-				result, err = n.NodeHost.StaleRead(e.regionID, query)
-			} else {
-				for {
-					result, err = n.NodeHost.SyncRead(rctx, e.regionID, query)
-					if err == nil || rctx.Err() != nil {
-						break
-					}
-					if !(errors.Is(err, dragonboat.ErrClusterNotReady) || errors.Is(err, dragonboat.ErrSystemBusy) ||
-						errors.Is(err, dragonboat.ErrTimeout)) {
-						break
-					}
-					select { // transient (no leader yet / busy): retry shortly
-					case <-rctx.Done():
-					case <-time.After(20 * time.Millisecond):
-					}
-					if rctx.Err() != nil {
-						break
-					}
-				}
-			}
-			results <- rres{e.regionID, result, err}
-		}(e)
-	}
 	for range targets {
 		r := <-results
 		if r.err != nil {
-			if errors.Is(r.err, dragonboat.ErrClusterClosed) || errors.Is(r.err, dragonboat.ErrClusterNotFound) {
-				continue // region retired while the read was in flight
-			}
 			failures = append(failures, fmt.Sprintf("region %d: %v", r.rid, r.err))
 			continue
 		}
-		kv, ok := r.res.(*mec.KVResult)
-		if !ok || !kv.Found {
+		kv, ok := r.value.(*mec.KVResult)
+		if !ok {
+			failures = append(failures, fmt.Sprintf("region %d: unexpected result %T", r.rid, r.value))
 			continue
 		}
-		regionValues[r.rid] = kv.Val
-		if !found || kv.Ver > bestVer {
-			found, bestVer, bestVal = true, kv.Ver, kv.Val
+		if kv.Found {
+			values[r.rid] = kv.Val
+			if !found || kv.Ver > bestVer {
+				found, bestVer, bestVal = true, kv.Ver, kv.Val
+			}
 		}
 	}
-	resp := &pb.SyncReadResponse{LatencyUs: time.Since(start).Microseconds(), RegionValues: regionValues}
-	switch {
-	case len(targets) == 0:
-		resp.Error = fmt.Sprintf("node %d hosts no region", n.NodeID)
-	case len(failures) > 0:
-		// partial read: freshness cannot be guaranteed -> report failure (client may retry)
-		resp.Error = "partial read: " + strings.Join(failures, "; ")
-	default:
-		resp.Found, resp.Value = found, bestVal
+	resp := &pb.SyncReadResponse{LatencyUs: time.Since(start).Microseconds()}
+	if len(failures) > 0 {
+		resp.Error = "read incomplete: " + strings.Join(failures, "; ")
+		return resp, nil
 	}
+	resp.Found, resp.Value, resp.RegionValues = found, bestVal, values
 	return resp, nil
 }
 

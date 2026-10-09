@@ -216,7 +216,7 @@ class UAVFleet:
         val = f"{step}:{rec.uav}:{rec.t:.3f}"
         if self.cluster is not None:
             w = self.cluster[node].propose(key, val, ver=step + 1, client_id=rec.uav + 1,
-                                           request_id=step, timeout_s=self.cfg.rpc_timeout_s)
+                                           timeout_s=self.cfg.rpc_timeout_s)
             rec.write_ok, rec.write_latency_ms = w.success, w.latency_ms
             if not w.success and not rec.err:
                 rec.err = w.error[:120]
@@ -339,7 +339,7 @@ class LoadGenerator:
             t_req = self.clock.now()
             try:
                 r = self.cluster[nid].propose(f"load-{nid}-{w}", f"{i}:{self.payload}", client_id=1000 + nid,
-                                              request_id=i, timeout_s=self.timeout)
+                                              timeout_s=self.timeout)
             except Exception:                       # e.g. channel closed during shutdown
                 if self._stop.is_set():
                     break

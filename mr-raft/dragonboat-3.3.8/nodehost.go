@@ -2053,6 +2053,27 @@ func (nu *nodeUser) NodeID() uint64 {
 	return nu.node.nodeID
 }
 
+// AppliedMembership returns a deep copy of the membership already applied by
+// this particular local replica. It does not perform a linearizable read and
+// must not be used to infer the current global membership. A retained node-user
+// handle can prove that its own replica applied removal even after NodeHost
+// automatically unloads that replica and ReadIndex becomes unavailable.
+// INodeUser is deliberately unchanged; applications may opt into this accessor.
+func (nu *nodeUser) AppliedMembership() *Membership {
+	m := nu.node.sm.GetMembership()
+	removed := make(map[uint64]struct{}, len(m.Removed))
+	for id, wasRemoved := range m.Removed {
+		if wasRemoved {
+			removed[id] = struct{}{}
+		}
+	}
+	return &Membership{
+		ConfigChangeID: m.ConfigChangeId,
+		Nodes:          m.Addresses, Observers: m.Observers, Witnesses: m.Witnesses,
+		Removed: removed,
+	}
+}
+
 func (nu *nodeUser) Propose(s *client.Session,
 	cmd []byte, timeout time.Duration) (*RequestState, error) {
 	req, err := nu.node.propose(s, cmd, nu.nh.getTimeoutTick(timeout))

@@ -3,6 +3,7 @@ module gitcode.com/lpray/multi-region-raft
 require (
 	github.com/bojand/ghz v0.117.0
 	github.com/cockroachdb/pebble v0.0.0-20210331181633-27fc006b8bfb
+	github.com/jhump/protoreflect v1.15.1
 	github.com/lni/dragonboat/v3 v3.3.8
 	google.golang.org/grpc v1.59.0
 	google.golang.org/protobuf v1.31.0
@@ -44,7 +45,6 @@ require (
 	github.com/hashicorp/memberlist v0.2.2 // indirect
 	github.com/huandu/xstrings v1.3.3 // indirect
 	github.com/imdario/mergo v0.3.11 // indirect
-	github.com/jhump/protoreflect v1.15.1 // indirect
 	github.com/jinzhu/configor v1.2.1 // indirect
 	github.com/juju/ratelimit v1.0.2-0.20191002062651-f60b32039441 // indirect
 	github.com/kr/pretty v0.1.0 // indirect
